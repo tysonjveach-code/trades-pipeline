@@ -9,21 +9,27 @@ Where everything ends up:
     Bad rows             -> load_errors table     + logs/pipeline.log
     Duplicates           -> skipped               + logs/pipeline.log
     Summary of each run  -> load_runs table
+
+Good rows are sent to Postgres in batches of BATCH_SIZE instead of one at a
+time. If Postgres rejects a batch, that batch is retried one row at a time
+so only the bad row fails.
 """
 
 import hashlib
 import logging
 import os
 import sys
+import time
 
 import psycopg
 
 from handlers import (
     handle_bad_row,
-    handle_cleaned_row,
     handle_duplicate_row,
     handle_file_already_loaded,
+    handle_good_batch,
     handle_good_row,
+    log_cleaned_row,
 )
 from load_csv import load_csv
 from validate import clean_row, validate
@@ -32,8 +38,14 @@ from validate import clean_row, validate
 #   export DATABASE_URL="postgresql://postgres:yourpassword@localhost:5432/trades_db"
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/trades_db")
 
+BATCH_SIZE = 4000
+
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(PROJECT_DIR, "logs", "pipeline.log")
+
+# Errors that mean "Postgres didn't like the data", as opposed to
+# "can't connect" or "the SQL is broken". Only these trigger the fallback.
+BAD_DATA_ERRORS = (psycopg.errors.DataError, psycopg.errors.IntegrityError)
 
 
 def setup_logging():
@@ -57,11 +69,68 @@ def file_hash(path):
     return h.hexdigest()
 
 
+def send_batch(conn, cur, batch, run_id, counts):
+    """
+    Try to insert the whole batch in one call.
+
+    `batch` is a list of (original_row, cleaned_row) pairs. We keep the
+    original so a bad row can be saved to load_errors exactly as it was.
+
+    conn.transaction() makes a savepoint: if the batch fails, everything
+    from this batch is undone, but earlier batches stay.
+    """
+    cleaned_rows = []
+    for original, cleaned in batch:
+        cleaned_rows.append(cleaned)
+
+    try:
+        with conn.transaction():
+            inserted, duplicates = handle_good_batch(cur, cleaned_rows, run_id)
+    except BAD_DATA_ERRORS as e:
+        logging.warning(
+            "BATCH rows %s-%s rejected (%s). Retrying one row at a time.",
+            cleaned_rows[0]["row_number"],
+            cleaned_rows[-1]["row_number"],
+            e.diag.message_primary,
+        )
+        send_rows_one_at_a_time(conn, cur, batch, run_id, counts)
+        return
+
+    counts["loaded"] += inserted
+    counts["skipped"] += duplicates
+
+
+def send_rows_one_at_a_time(conn, cur, batch, run_id, counts):
+    """
+    The fallback. Slow, but only runs for a batch that had a bad row in it.
+    Good rows still load, and the bad row goes to load_errors.
+    """
+    for original, cleaned in batch:
+        try:
+            with conn.transaction():
+                inserted = handle_good_row(cur, cleaned, run_id)
+        except BAD_DATA_ERRORS as e:
+            reason = f"database rejected it: {e.diag.message_primary}"
+            handle_bad_row(cur, original, run_id, [reason])
+            counts["failed"] += 1
+            continue
+
+        if inserted:
+            counts["loaded"] += 1
+        else:
+            handle_duplicate_row(cleaned)
+            counts["skipped"] += 1
+
+
 def run(csv_path):
     setup_logging()
+    start = time.perf_counter()
+
     file_name = os.path.basename(csv_path)
     digest = file_hash(csv_path)
 
+    # loaded  = rows inserted into trades (includes cleaned ones)
+    # cleaned = rows clean_row() had to fix
     counts = {"loaded": 0, "cleaned": 0, "failed": 0, "skipped": 0}
 
     # `with` = commit if everything works, roll back EVERYTHING if it crashes.
@@ -86,6 +155,8 @@ def run(csv_path):
             # Read the whole CSV into a list of dictionaries
             rows = load_csv(csv_path)
 
+            batch = []
+
             for row in rows:
                 cleaned, was_changed = clean_row(row)
                 errors = validate(cleaned)
@@ -96,31 +167,21 @@ def run(csv_path):
                     counts["failed"] += 1
                     continue
 
-                # Safety net: if your validate() misses something, Postgres will
-                # reject it. conn.transaction() makes a "savepoint" so one bad
-                # insert gets undone by itself instead of breaking the whole load.
-                try:
-                    with conn.transaction():
-                        if was_changed:
-                            inserted = handle_cleaned_row(cur, row, cleaned, run_id)
-                        else:
-                            inserted = handle_good_row(cur, cleaned, run_id)
-                except (psycopg.errors.DataError, psycopg.errors.IntegrityError) as e:
-                    reason = f"database rejected it: {e.diag.message_primary}"
-                    handle_bad_row(cur, row, run_id, [reason])
-                    counts["failed"] += 1
-                    continue
-
-                # ---- CASE: duplicate ----
-                if not inserted:
-                    handle_duplicate_row(cleaned)
-                    counts["skipped"] += 1
-
-                # ---- CASE: good or cleaned row ----
-                elif was_changed:
+                # ---- CASE: messy but fixed ----
+                if was_changed:
+                    log_cleaned_row(row, cleaned)
                     counts["cleaned"] += 1
-                else:
-                    counts["loaded"] += 1
+
+                # ---- CASE: good row -> wait in the batch ----
+                batch.append((row, cleaned))
+
+                if len(batch) == BATCH_SIZE:
+                    send_batch(conn, cur, batch, run_id, counts)
+                    batch = []
+
+            # The last batch is usually not full. Don't forget it!
+            if batch:
+                send_batch(conn, cur, batch, run_id, counts)
 
             cur.execute(
                 """
@@ -131,9 +192,11 @@ def run(csv_path):
                 (counts["loaded"], counts["cleaned"], counts["failed"], counts["skipped"], run_id),
             )
 
+    seconds = time.perf_counter() - start
     summary = (
-        f"Run {run_id} done: {counts['loaded']} loaded, {counts['cleaned']} cleaned + loaded, "
-        f"{counts['failed']} failed, {counts['skipped']} duplicates skipped"
+        f"Run {run_id} done in {seconds:.2f}s: {counts['loaded']} loaded "
+        f"({counts['cleaned']} of them cleaned first), {counts['failed']} failed, "
+        f"{counts['skipped']} duplicates skipped"
     )
     logging.info(summary)
     print(summary)
