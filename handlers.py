@@ -160,3 +160,58 @@ def handle_duplicate_row(row):
         row["row_number"],
         row["trade_id"],
     )
+
+
+def handle_good_rows_copy(cur, rows, run_id):
+    """
+    The fastest way to load: COPY everything into a temporary staging table,
+    then move it into trades with ONE INSERT that skips duplicates.
+
+    Three steps, because COPY can't do ON CONFLICT by itself:
+        1. CREATE TEMP TABLE staging   -> an empty holding table, no rules
+        2. COPY rows into staging      -> streams every row in one go
+        3. INSERT INTO trades SELECT ... FROM staging ON CONFLICT DO NOTHING
+
+    Returns (inserted, duplicates).
+    """
+    cur.execute(
+        """
+        CREATE TEMP TABLE staging (
+            trade_id   TEXT,
+            symbol     TEXT,
+            side       TEXT,
+            price      NUMERIC,
+            quantity   INT,
+            trade_time TIMESTAMP
+        ) ON COMMIT DROP
+        """
+    )
+
+    with cur.copy(
+        "COPY staging (trade_id, symbol, side, price, quantity, trade_time) FROM STDIN"
+    ) as copy:
+        for row in rows:
+            copy.write_row((
+                row["trade_id"],
+                row["symbol"],
+                row["side"],
+                row["price"],
+                row["quantity"],
+                row["trade_time"],
+            ))
+
+    cur.execute(
+        """
+        INSERT INTO trades (trade_id, symbol, side, price, quantity, trade_time, run_id)
+        SELECT trade_id, symbol, side, price, quantity, trade_time, %s
+        FROM staging
+        ON CONFLICT (trade_id) DO NOTHING
+        """,
+        (run_id,),
+    )
+
+    inserted = cur.rowcount
+    duplicates = len(rows) - inserted
+    logger.info("COPY %s rows: %s inserted, %s duplicates skipped", len(rows), inserted, duplicates)
+
+    return inserted, duplicates

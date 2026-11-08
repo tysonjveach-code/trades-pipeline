@@ -10,9 +10,9 @@ Where everything ends up:
     Duplicates           -> skipped               + logs/pipeline.log
     Summary of each run  -> load_runs table
 
-Good rows are sent to Postgres in batches of BATCH_SIZE instead of one at a
-time. If Postgres rejects a batch, that batch is retried one row at a time
-so only the bad row fails.
+All good rows are sent to Postgres at once with COPY (the fastest way).
+If Postgres rejects anything, it falls back step by step so only the bad row fails:
+    COPY everything -> batches of BATCH_SIZE -> one row at a time
 """
 
 import hashlib
@@ -29,6 +29,7 @@ from handlers import (
     handle_file_already_loaded,
     handle_good_batch,
     handle_good_row,
+    handle_good_rows_copy,
     log_cleaned_row,
 )
 from load_csv import load_csv
@@ -122,6 +123,35 @@ def send_rows_one_at_a_time(conn, cur, batch, run_id, counts):
             counts["skipped"] += 1
 
 
+def send_with_copy(conn, cur, good_rows, run_id, counts):
+    """
+    Load ALL good rows at once with COPY (fastest).
+
+    If Postgres rejects anything, undo it and fall back to batches.
+    A bad batch then falls back to one row at a time, so only the bad row fails.
+        COPY everything -> batches of 4000 -> one row at a time
+    """
+    if not good_rows:
+        return
+
+    cleaned_rows = []
+    for original, cleaned in good_rows:
+        cleaned_rows.append(cleaned)
+
+    try:
+        with conn.transaction():
+            inserted, duplicates = handle_good_rows_copy(cur, cleaned_rows, run_id)
+    except BAD_DATA_ERRORS as e:
+        logging.warning("COPY rejected (%s). Falling back to batches.", e.diag.message_primary)
+        for start in range(0, len(good_rows), BATCH_SIZE):
+            batch = good_rows[start:start + BATCH_SIZE]
+            send_batch(conn, cur, batch, run_id, counts)
+        return
+
+    counts["loaded"] += inserted
+    counts["skipped"] += duplicates
+
+
 def run(csv_path):
     setup_logging()
     start = time.perf_counter()
@@ -155,7 +185,7 @@ def run(csv_path):
             # Read the whole CSV into a list of dictionaries
             rows = load_csv(csv_path)
 
-            batch = []
+            good_rows = []
 
             for row in rows:
                 cleaned, was_changed = clean_row(row)
@@ -172,16 +202,11 @@ def run(csv_path):
                     log_cleaned_row(row, cleaned)
                     counts["cleaned"] += 1
 
-                # ---- CASE: good row -> wait in the batch ----
-                batch.append((row, cleaned))
+                # ---- CASE: good row -> collect it ----
+                good_rows.append((row, cleaned))
 
-                if len(batch) == BATCH_SIZE:
-                    send_batch(conn, cur, batch, run_id, counts)
-                    batch = []
-
-            # The last batch is usually not full. Don't forget it!
-            if batch:
-                send_batch(conn, cur, batch, run_id, counts)
+            # ---- Every row has been checked. Now send all the good ones at once. ----
+            send_with_copy(conn, cur, good_rows, run_id, counts)
 
             cur.execute(
                 """
