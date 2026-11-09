@@ -186,6 +186,7 @@ def run(csv_path):
             rows = load_csv(csv_path)
 
             good_rows = []
+            seen_ids = set()
 
             for row in rows:
                 cleaned, was_changed = clean_row(row)
@@ -196,6 +197,14 @@ def run(csv_path):
                     handle_bad_row(cur, row, run_id, errors)
                     counts["failed"] += 1
                     continue
+
+                # ---- CASE: duplicate row ----
+                if cleaned["trade_id"] in seen_ids:
+                    handle_duplicate_row(cleaned)
+                    counts["skipped"] += 1
+                    continue
+
+                seen_ids.add(cleaned["trade_id"])
 
                 # ---- CASE: messy but fixed ----
                 if was_changed:
